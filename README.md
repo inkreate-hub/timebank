@@ -32,3 +32,10 @@ Reset the timer and return to `+x1`.
 The timer is now rendered as a **large seven-segment digital display** rather than normal text. It occupies most of the 640×172 landscape screen.
 
 The rest of the UI remains black and white with the small speed/status indicator underneath.
+
+
+### IMU side-tap scale behavior (v7)
+- Positive tap from any negative scale switches to `X 1.0`.
+- Negative tap from any positive scale switches to `X -1.0`.
+- Positive taps then step `X 1.0 -> X 1.5 -> X 2.0 -> X 3.0`.
+- Negative taps then step `X -1.0 -> X -1.5 -> X -2.0 -> X -3.0`.

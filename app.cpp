@@ -1,4 +1,7 @@
+#include <Arduino.h>
 #include "app.h"
+#include "i2c_bsp.h"
+#include "esp_err.h"
 #include "lvgl.h"
 #include "esp_timer.h"
 #include <stdio.h>
@@ -119,6 +122,180 @@ static lv_color_t rate_indicator_color(double rate)
 static lv_point_t press_point;
 static uint32_t press_tick = 0;
 static bool long_reset_done = false;
+
+static double get_elapsed_us();
+static void refresh_ui();
+
+/*
+ * Side-tap input using the onboard QMI8658 accelerometer.
+ *
+ * A tap on one side produces a short acceleration impulse on the board's
+ * X axis.  We use the accelerometer rather than gyro rate because an impact
+ * is much easier to distinguish by its linear acceleration.
+ *
+ * If the physical +X direction is opposite on your mounting, change
+ * IMU_TAP_POSITIVE_SIGN from +1 to -1.
+ */
+#define IMU_TAP_POSITIVE_SIGN (+1)
+#define IMU_TAP_THRESHOLD_G 1.20f
+#define IMU_TAP_RELEASE_G   0.85f
+#define IMU_TAP_COOLDOWN_MS 220
+#define IMU_TAP_POLL_MS 10
+
+static bool imu_ready = false;
+static bool imu_tap_armed = true;
+static uint32_t imu_last_tap_ms = 0;
+static float imu_ax_g = 0.0f;
+
+static bool imu_write_reg(uint8_t reg, uint8_t value)
+{
+    return i2c_write_buff(imu_dev_handle, reg, &value, 1) == ESP_OK;
+}
+
+static bool imu_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    return i2c_read_buff(imu_dev_handle, reg, buf, len) == ESP_OK;
+}
+
+static bool imu_init_tap_sensor()
+{
+    if (imu_dev_handle == NULL)
+        return false;
+
+    uint8_t who = 0;
+    if (!imu_read_regs(0x00, &who, 1) || who != 0x05) {
+        Serial.printf("QMI8658 not detected (WHO_AM_I=0x%02X)\\n", who);
+        return false;
+    }
+
+    /*
+     * QMI8658:
+     * CTRL1 0x02 = 0x60: auto-increment + standard I2C configuration
+     * CTRL2 0x03 = 0x03: accelerometer +/-2 g, 1000 Hz
+     * CTRL3 0x04 = 0x43: gyro +/-256 dps, 1000 Hz (also enabled below)
+     * CTRL7 0x08 = 0x03: accelerometer + gyro enabled
+     *
+     * We only use acceleration for tap detection, but leave both sensors
+     * enabled so the board's IMU remains available for future gestures.
+     */
+    if (!imu_write_reg(0x02, 0x60)) return false;
+    if (!imu_write_reg(0x03, 0x03)) return false;
+    if (!imu_write_reg(0x04, 0x43)) return false;
+    if (!imu_write_reg(0x08, 0x03)) return false;
+
+    Serial.println("QMI8658 initialized for side-tap detection");
+    return true;
+}
+
+static bool imu_read_accel_x(float &ax_g)
+{
+    uint8_t raw[6];
+    if (!imu_read_regs(0x35, raw, sizeof(raw)))
+        return false;
+
+    int16_t ax = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+    int16_t ay = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
+    int16_t az = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
+    (void)ay;
+    (void)az;
+
+    /* +/-2 g range = 16384 LSB/g. */
+    ax_g = (float)ax / 16384.0f;
+    return true;
+}
+
+/*
+ * A positive-side tap selects/increases the positive scale:
+ *   X 1.0 -> X 1.5 -> X 2.0 -> X 3.0
+ *
+ * A negative-side tap selects/decreases the negative scale:
+ *   X -1.0 -> X -1.5 -> X -2.0 -> X -3.0
+ *
+ * One tap crossing from one side to the other starts at +/-1.0.
+ */
+static void change_rate_from_tap(bool positive)
+{
+    // Crossing to the other side ALWAYS starts at +/-1.0.
+    // Staying on the same side steps through the scales:
+    //   +1.0 -> +1.5 -> +2.0 -> +3.0
+    //   -1.0 -> -1.5 -> -2.0 -> -3.0
+    //
+    // Use the current scale value rather than relying on the array index,
+    // so a tap can never accidentally jump back to the wrong index.
+    double current = rates[rate_index];
+
+    if (positive) {
+        if (current < 0.0) {
+            // Negative -> positive: always start at +1.0.
+            rate_index = 3;
+        } else if (current == 1.0) {
+            rate_index = 2;  // +1.0 -> +1.5
+        } else if (current == 1.5) {
+            rate_index = 1;  // +1.5 -> +2.0
+        } else if (current == 2.0) {
+            rate_index = 0;  // +2.0 -> +3.0
+        }
+        // At +3.0, stay at +3.0.
+    } else {
+        if (current > 0.0) {
+            // Positive -> negative: always start at -1.0.
+            rate_index = 4;
+        } else if (current == -1.0) {
+            rate_index = 5;  // -1.0 -> -1.5
+        } else if (current == -1.5) {
+            rate_index = 6;  // -1.5 -> -2.0
+        } else if (current == -2.0) {
+            rate_index = 7;  // -2.0 -> -3.0
+        }
+        // At -3.0, stay at -3.0.
+    }
+
+    refresh_ui();
+}
+
+static void imu_tap_update()
+{
+    if (!imu_ready)
+        return;
+
+    static uint32_t last_poll_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - last_poll_ms) < IMU_TAP_POLL_MS)
+        return;
+    last_poll_ms = now;
+
+    float ax = 0.0f;
+    if (!imu_read_accel_x(ax))
+        return;
+
+    imu_ax_g = ax;
+
+    float signed_ax = ax * IMU_TAP_POSITIVE_SIGN;
+    float magnitude = fabsf(signed_ax);
+
+    /* Re-arm only after the impact has settled. */
+    if (!imu_tap_armed) {
+        if (magnitude < IMU_TAP_RELEASE_G &&
+            (uint32_t)(now - imu_last_tap_ms) >= IMU_TAP_COOLDOWN_MS) {
+            imu_tap_armed = true;
+        }
+        return;
+    }
+
+    if (magnitude < IMU_TAP_THRESHOLD_G)
+        return;
+
+    bool positive = signed_ax > 0.0f;
+    change_rate_from_tap(positive);
+
+    imu_last_tap_ms = now;
+    imu_tap_armed = false;
+
+    Serial.printf("IMU side tap: %s  ax=%+.2fg  scale=%s\n",
+                  positive ? "POSITIVE" : "NEGATIVE",
+                  signed_ax,
+                  rate_names[rate_index]);
+}
 
 /* Seven-segment geometry. */
 #define DIGIT_W 50
@@ -397,6 +574,7 @@ static void refresh_ui()
 
 static void ui_timer_callback(lv_timer_t *)
 {
+    imu_tap_update();
     refresh_ui();
 }
 
@@ -515,6 +693,7 @@ void app_ui_init(void)
     lv_obj_set_width(rate_label, 620);
     lv_obj_align(rate_label, LV_ALIGN_TOP_MID, 0, 8);
 
+
     status_label = lv_label_create(screen);
     lv_label_set_text(status_label, "PAUSED");
     lv_obj_set_style_text_color(status_label, lv_color_hex(0xFFFFFF), 0);
@@ -545,6 +724,7 @@ void app_ui_init(void)
     lv_obj_add_event_cb(
         gesture_layer, gesture_event, LV_EVENT_RELEASED, NULL);
 
+    imu_ready = imu_init_tap_sensor();
     lv_timer_create(ui_timer_callback, 20, NULL);
     refresh_ui();
 }
