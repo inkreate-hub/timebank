@@ -15,7 +15,8 @@ static unsigned long pwrPressedAt = 0;
 
 static void shutdownFromPowerButton()
 {
-  Serial.println("PWR long press: shutting down battery power");
+  Serial.println("PWR long press: saving stopwatch state and shutting down");
+  app_prepare_for_shutdown();
   delay(100);
   power_expander_set_hold(false);
   delay(500);

@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "lvgl.h"
 #include "esp_timer.h"
+#include <Preferences.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
@@ -30,6 +31,13 @@ static bool running = false;
 static double elapsed_us = 0.0;
 static int64_t start_timestamp_us = 0;
 static int rate_index = 3;   // +x1 at startup
+
+static Preferences state_prefs;
+static bool state_prefs_ready = false;
+static uint32_t last_periodic_save_ms = 0;
+
+static void save_persistent_state();
+static void load_persistent_state();
 
 /*
  * Speed order, exactly as requested:
@@ -125,6 +133,44 @@ static bool long_reset_done = false;
 
 static double get_elapsed_us();
 static void refresh_ui();
+
+static void init_persistent_state()
+{
+    if (!state_prefs_ready) {
+        state_prefs.begin("stopwatch", false);
+        state_prefs_ready = true;
+    }
+}
+
+static void save_persistent_state()
+{
+    init_persistent_state();
+
+    double current_elapsed_us = get_elapsed_us();
+    state_prefs.putDouble("elapsed_us", current_elapsed_us);
+    state_prefs.putInt("rate_index", rate_index);
+}
+
+static void load_persistent_state()
+{
+    init_persistent_state();
+
+    elapsed_us = state_prefs.getDouble("elapsed_us", 0.0);
+    rate_index = state_prefs.getInt("rate_index", 3);
+
+    if (rate_index < 0 || rate_index >= RATE_COUNT)
+        rate_index = 3;
+
+    // Time cannot continue while the ESP32 is powered off, so always
+    // restore the saved value in the paused state.
+    running = false;
+    start_timestamp_us = 0;
+}
+
+void app_prepare_for_shutdown()
+{
+    save_persistent_state();
+}
 
 /*
  * Side-tap input using the onboard QMI8658 accelerometer.
@@ -223,6 +269,14 @@ static void change_rate_from_tap(bool positive)
     // Use the current scale value rather than relying on the array index,
     // so a tap can never accidentally jump back to the wrong index.
     double current = rates[rate_index];
+
+    // Re-bank the elapsed time against the current rate before switching,
+    // otherwise the whole span since the last rate change gets multiplied
+    // by the new rate and the display can jump straight past zero.
+    if (running) {
+        elapsed_us = get_elapsed_us();
+        start_timestamp_us = esp_timer_get_time();
+    }
 
     if (positive) {
         if (current < 0.0) {
@@ -575,6 +629,15 @@ static void refresh_ui()
 static void ui_timer_callback(lv_timer_t *)
 {
     imu_tap_update();
+
+    // Periodically checkpoint the running timer so the latest value is
+    // still available even if power is lost unexpectedly.
+    uint32_t now = millis();
+    if ((uint32_t)(now - last_periodic_save_ms) >= 5000) {
+        save_persistent_state();
+        last_periodic_save_ms = now;
+    }
+
     refresh_ui();
 }
 
@@ -588,6 +651,7 @@ static void toggle_running()
         running = true;
     }
 
+    save_persistent_state();
     refresh_ui();
 }
 
@@ -600,6 +664,7 @@ static void reset_all()
     /* Reset to normal forward speed. */
     rate_index = 3;
 
+    save_persistent_state();
     refresh_ui();
 }
 
@@ -617,6 +682,7 @@ static void change_rate(int direction)
     if (rate_index >= RATE_COUNT)
         rate_index = RATE_COUNT - 1;
 
+    save_persistent_state();
     refresh_ui();
 }
 
@@ -678,6 +744,9 @@ static void gesture_event(lv_event_t *event)
 
 void app_ui_init(void)
 {
+    load_persistent_state();
+    last_periodic_save_ms = millis();
+
     lv_obj_t *screen = lv_screen_active();
 
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
